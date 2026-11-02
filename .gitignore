@@ -1,0 +1,10 @@
+# 构建产物
+habar
+*.app/
+build/
+*.o
+
+# 本机笔记（含个人环境信息，不进仓库）
+LOCAL-NOTES.md
+
+.DS_Store
