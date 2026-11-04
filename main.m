@@ -1,9 +1,17 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 #import "HAClient.h"
+#import "PowerReporter.h"
 
 static NSString *const kURLKey = @"ha_url";
 static NSString *const kTokenKey = @"ha_token";
+static NSString *const kMQTTEnabledKey = @"mqtt_enabled";
+static NSString *const kMQTTHostKey = @"mqtt_host";
+static NSString *const kMQTTPortKey = @"mqtt_port";
+static NSString *const kMQTTUserKey = @"mqtt_user";
+static NSString *const kMQTTPassKey = @"mqtt_pass";
+static NSString *const kMQTTDeviceKey = @"mqtt_device";
 static NSString *const kDefaultURL = @"http://192.168.31.200:8123";
 static NSString *const kDefaultToken = @"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI4YWFhYzRkYTA5ZjA0YTY4OGFmZmQyYzM3ZGVkNmE4NCIsImlhdCI6MTc5MzYxOTcyMCwiZXhwIjoyMTA4OTc5NzIwfQ.9vaazzOqmYfijwONjY6tW_8x_26fZWgr1HtzCXA_SVk";
 
@@ -43,6 +51,8 @@ static NSString *JSStringLiteral(NSString *s) {
 @property (nonatomic, assign) NSUInteger noiseSkipped;
 @property (nonatomic, assign) NSUInteger statIn;
 @property (nonatomic, assign) NSUInteger statOut;
+@property (nonatomic, strong) PowerReporter *reporter;
+@property (nonatomic, copy) NSString *mqttStatusText;
 @end
 
 @implementation AppDelegate
@@ -86,6 +96,7 @@ static NSString *JSStringLiteral(NSString *s) {
 
     [self buildStatusItem];
     [self.client start];
+    [self setupReporter];
     [self registerGlobalHotkeyFallback];
 
     if (gStats) {
@@ -107,6 +118,11 @@ static NSString *JSStringLiteral(NSString *s) {
             });
         }
     }
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+    // 关机流程里 reporter 已经把状态发成 off，这里不会再打 offline
+    [self.reporter stopForQuit];
 }
 
 - (void)registerGlobalHotkeyFallback {
@@ -188,6 +204,24 @@ static NSString *JSStringLiteral(NSString *s) {
         self.cachedStates = nil;
         [self.client restart];
         [self toast:@"已保存设置，正在重新连接"];
+        return;
+    }
+    if ([action isEqualToString:@"saveMQTT"]) {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        if (body[@"enabled"] != nil) [ud setBool:[body[@"enabled"] boolValue] forKey:kMQTTEnabledKey];
+        if ([body[@"host"] isKindOfClass:[NSString class]]) [ud setObject:body[@"host"] forKey:kMQTTHostKey];
+        if (body[@"port"] != nil) [ud setInteger:[body[@"port"] integerValue] forKey:kMQTTPortKey];
+        if ([body[@"user"] isKindOfClass:[NSString class]]) [ud setObject:body[@"user"] forKey:kMQTTUserKey];
+        // 密码留空表示「不修改」
+        if ([body[@"pass"] isKindOfClass:[NSString class]] && [(NSString *)body[@"pass"] length]) {
+            [ud setObject:body[@"pass"] forKey:kMQTTPassKey];
+        }
+        if ([body[@"device"] isKindOfClass:[NSString class]] && [(NSString *)body[@"device"] length]) {
+            [ud setObject:body[@"device"] forKey:kMQTTDeviceKey];
+        }
+        [ud synchronize];
+        [self restartReporter];
+        [self toast:@"MQTT 设置已保存"];
         return;
     }
     if ([action isEqualToString:@"refresh"]) {
@@ -308,11 +342,19 @@ static NSString *JSStringLiteral(NSString *s) {
 }
 
 - (void)pushConfig {
+    NSDictionary *mq = [self reporterConfig];
     [self sendEvent:@{@"t": @"config",
                       @"url": self.client.baseURL ?: @"",
                       @"token": self.client.token ?: @"",
                       @"autostart": @([self autostartEnabled]),
-                      @"noise": @(self.filterNoise)}];
+                      @"noise": @(self.filterNoise),
+                      @"mqtt": @{@"on": mq[@"enabled"] ?: @NO,
+                                 @"host": mq[@"host"] ?: @"",
+                                 @"port": mq[@"port"] ?: @1883,
+                                 @"user": mq[@"user"] ?: @"",
+                                 @"device": mq[@"device"] ?: @"",
+                                 @"hasPass": @([(NSString *)mq[@"pass"] length] > 0),
+                                 @"status": self.mqttStatusText ?: @""}}];
 }
 
 - (void)pushStatus {
@@ -329,6 +371,69 @@ static NSString *JSStringLiteral(NSString *s) {
     // 即使没有存过也要发（空字典），前端据此判断「确实没存过」才做首次播种
     NSDictionary *prefs = [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"ui_prefs"] ?: @{};
     [self sendEvent:@{@"t": @"prefs", @"data": prefs}];
+}
+
+#pragma mark - 本机电源状态上报（MQTT）
+
+- (NSString *)defaultDeviceName {
+    // 系统设置里的「电脑名称」，比 hostName 好看（后者是 mac-xxxdeMac-Pro.local 这种）
+    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("cn.local.habar"), NULL, NULL);
+    NSString *name = nil;
+    if (store) {
+        CFStringRef cn = SCDynamicStoreCopyComputerName(store, NULL);
+        if (cn) name = (__bridge_transfer NSString *)cn;
+        CFRelease(store);
+    }
+    if (!name.length) name = [NSProcessInfo processInfo].hostName;
+    if ([name hasSuffix:@".local"]) name = [name stringByDeletingPathExtension];
+    return name.length ? name : @"Mac";
+}
+
+- (NSDictionary *)reporterConfig {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *host = [ud stringForKey:kMQTTHostKey];
+    if (!host.length) {
+        // 默认取 HA 地址的主机名：broker 通常和 HA 在同一台机器上
+        NSString *ha = [ud stringForKey:kURLKey] ?: @"";
+        NSURL *u = [NSURL URLWithString:ha];
+        host = u.host ?: @"";
+    }
+    NSInteger port = [ud integerForKey:kMQTTPortKey];
+    NSString *device = [ud stringForKey:kMQTTDeviceKey];
+    if (!device.length) device = [self defaultDeviceName];
+    return @{@"enabled": @([ud boolForKey:kMQTTEnabledKey]),
+             @"host": host ?: @"",
+             @"port": @(port > 0 ? port : 1883),
+             @"user": [ud stringForKey:kMQTTUserKey] ?: @"",
+             @"pass": [ud stringForKey:kMQTTPassKey] ?: @"",
+             @"device": device ?: @""};
+}
+
+- (void)setupReporter {
+    NSDictionary *cfg = [self reporterConfig];
+    self.reporter = [[PowerReporter alloc] initWithConfig:cfg];
+    self.mqttStatusText = [cfg[@"enabled"] boolValue] ? @"连接中…" : @"未启用";
+
+    __weak typeof(self) weakSelf = self;
+    self.reporter.onStatus = ^(NSString *text, BOOL connected) {
+        weakSelf.mqttStatusText = text;
+        [weakSelf pushMQTTStatus];
+    };
+    self.reporter.onStateChange = ^(NSString *state) {
+        NSLog(@"[HABar] 本机状态 -> %@", state);
+    };
+    [self.reporter start];
+}
+
+- (void)pushMQTTStatus {
+    [self sendEvent:@{@"t": @"mqtt", @"msg": self.mqttStatusText ?: @""}];
+}
+
+- (void)restartReporter {
+    [self.reporter stopSilently];
+    self.reporter = nil;
+    [self setupReporter];
+    [self pushConfig];
 }
 
 #pragma mark - HAClientDelegate

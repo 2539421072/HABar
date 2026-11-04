@@ -23,6 +23,7 @@ const H = {
   lastManageSig: '',
   autostart: false,
   noise: true,
+  mqtt: { on: false, host: '', port: 1883, user: '', device: '', hasPass: false, status: '' },
   prefsLoaded: false,
   booted: false,
 };
@@ -81,6 +82,21 @@ function post(msg) {
 
 function savePrefs() {
   post({ t: 'prefs', data: { order: H.order, group: H.group, hideUnavailable: H.hideUnavailable, seeded: H.seeded } });
+}
+
+function postMqtt(enabled) {
+  const val = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+  const host = val('mqHost').trim();
+  const port = parseInt(val('mqPort').trim() || '1883', 10) || 1883;
+  const user = val('mqUser').trim();
+  const pass = val('mqPass');
+  const device = val('mqDevice').trim();
+  H.mqtt.host = host;
+  H.mqtt.port = port;
+  H.mqtt.user = user;
+  H.mqtt.device = device;
+  if (pass) H.mqtt.hasPass = true;
+  post({ t: 'saveMQTT', enabled, host, port, user, pass, device });
 }
 
 /* ---------------- helpers ---------------- */
@@ -641,6 +657,38 @@ function settingsHTML() {
 
   <div class="mcard"><div class="form">
     <div class="setrow">
+      <div><div class="tt">上报本机电源状态</div><div class="dd">开机 / 睡眠 / 关机 通过 MQTT 上报到 Home Assistant</div></div>
+      <button class="sw ${H.mqtt.on ? 'on' : ''}" data-act="toggle-mqtt"></button>
+    </div>
+    <div class="field">
+      <label>MQTT 服务器</label>
+      <input type="text" id="mqHost" value="${esc(H.mqtt.host)}" placeholder="192.168.1.10" spellcheck="false">
+    </div>
+    <div class="field">
+      <label>端口</label>
+      <input type="text" id="mqPort" value="${H.mqtt.port || 1883}" placeholder="1883" spellcheck="false">
+    </div>
+    <div class="field">
+      <label>用户名（可留空）</label>
+      <input type="text" id="mqUser" value="${esc(H.mqtt.user)}" placeholder="匿名连接就留空" spellcheck="false">
+    </div>
+    <div class="field">
+      <label>密码（可留空）</label>
+      <input type="password" id="mqPass" value="" placeholder="${H.mqtt.hasPass ? '已保存，留空则不修改' : '匿名连接就留空'}" spellcheck="false">
+    </div>
+    <div class="field">
+      <label>设备名</label>
+      <input type="text" id="mqDevice" value="${esc(H.mqtt.device)}" placeholder="Mac Pro" spellcheck="false">
+    </div>
+    <div class="hint">上报为两个实体：开关机/睡眠状态（on / sleep / off）和上次开机时间。关机前会抢发一条 off，所以历史记录里能看到每一次关机和开机；睡眠显示 sleep，不会变成「不可用」。</div>
+    <div class="btn-row">
+      <button class="pill primary" data-act="save-mqtt">保存并连接</button>
+      <span class="hint" id="mqStatus" style="align-self:center;margin-left:4px">${esc(H.mqtt.status || '未启用')}</span>
+    </div>
+  </div></div>
+
+  <div class="mcard"><div class="form">
+    <div class="setrow">
       <div><div class="tt">按房间分组</div><div class="dd">在设备页按 HA 房间归类显示</div></div>
       <button class="sw ${H.group ? 'on' : ''}" data-act="toggle-group"></button>
     </div>
@@ -865,6 +913,18 @@ document.addEventListener('click', (ev) => {
       post({ t: 'test', url, token });
       const m = $('#testMsg');
       if (m) m.textContent = '测试中…';
+      break;
+    }
+    case 'toggle-mqtt': {
+      H.mqtt.on = !H.mqtt.on;
+      postMqtt(H.mqtt.on);
+      render(true);
+      break;
+    }
+    case 'save-mqtt': {
+      H.mqtt.on = true;
+      postMqtt(true);
+      toast('正在连接 MQTT');
       break;
     }
     case 'reconnect':
@@ -1203,7 +1263,25 @@ window.hb = {
         H.config = { url: m.url || '', token: m.token || '' };
         H.autostart = !!m.autostart;
         H.noise = m.noise !== false;
+        if (m.mqtt) {
+          H.mqtt = {
+            on: !!m.mqtt.on,
+            host: m.mqtt.host || '',
+            port: m.mqtt.port || 1883,
+            user: m.mqtt.user || '',
+            device: m.mqtt.device || '',
+            hasPass: !!m.mqtt.hasPass,
+            status: m.mqtt.status || '',
+          };
+        }
         if (H.tab === 'settings' && !isEditing()) render(true);
+        break;
+      case 'mqtt':
+        H.mqtt.status = m.msg || '';
+        if (H.tab === 'settings' && !isEditing()) {
+          const box = $('#mqStatus');
+          if (box) box.textContent = H.mqtt.status;
+        }
         break;
       case 'status':
         H.status = m.state;

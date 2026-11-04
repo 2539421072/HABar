@@ -75,6 +75,29 @@ open "/Applications/HA 面板.app"
 - `/` 或 `⌘F` 聚焦搜索
 - 设置页可开启开机自启（写 `~/Library/LaunchAgents/cn.local.habar.plist`）
 
+## 本机状态上报（可选）
+
+除了控制 HA 设备，面板还能把**这台 Mac 自己的电源状态**推回 HA：开一个 MQTT 连接，自动发现两个实体。
+
+| 实体 | 状态 |
+|---|---|
+| `sensor.<设备名>_power_state` | `on` / `sleep` / `off`（device_class: enum） |
+| `sensor.<设备名>_last_boot` | 本次开机时间（device_class: timestamp） |
+
+设置页填 MQTT 服务器（默认取 HA 地址的主机名）、端口、可选用户名密码、设备名，打开开关即可。匿名 broker 就把账号密码留空。
+
+**为什么睡眠不显示成「不可用」**：常见做法是用 MQTT 遗嘱（LWT）表示在线状态，但 Mac 一睡就发不出心跳，broker 超时后会把实体打成 `unavailable`——睡眠是正常状态，不该表现为设备挂了。所以这里不用 LWT：
+
+- 睡眠发 `sleep`，唤醒发 `on`；
+- 关机前（`NSWorkspaceWillPowerOffNotification`）抢发一条 `off`，历史里能看到每一次关机；
+- 状态全部 retained，HA 重启、broker 重启都不丢；
+- 每 5 分钟重发一次，防 broker 没开持久化把 retained 清了；
+- 退出 App 时把可用性置 `offline`（机器还在跑，只是上报停了）。
+
+属性里有 `last_event`（booted / slept / woke / shutdown）、`last_state_change`、`boot_time`、`uptime_seconds`，可以在 HA 里直接做「睡了多久」「今天开机几次」这类模板。
+
+局限：强制断电、内核崩溃这类没机会执行回调的关机，状态会停在最后一次上报值（不用 LWT，HA 无法感知）。要覆盖它得加心跳 + `expire_after`，代价是睡眠时也会被判成不可用——权衡后没做。
+
 ## 技术实现
 
 原生 ObjC + WKWebView，不是 Electron：内存几十 MB，启动即用，没有 runtime 依赖。
@@ -88,13 +111,15 @@ open "/Applications/HA 面板.app"
 ### 目录
 
 ```
-main.m          菜单栏图标、NSPopover、WKWebView、JS 桥、开机自启、调试参数
-HAClient.h/.m   REST + WebSocket 客户端（鉴权、房间注册表、服务调用、推送过滤）
-web/app.js      全部界面逻辑（设备卡片、控件、管理页）
-web/styles.css  样式（浅色/深色自动跟随系统）
-web/index.html  SVG symbol 图标集
-icon.svg        App 图标
-build.sh        编译 + 渲染图标 + 打包 + ad-hoc 签名
+main.m            菜单栏图标、NSPopover、WKWebView、JS 桥、开机自启、调试参数
+HAClient.h/.m     REST + WebSocket 客户端（鉴权、房间注册表、服务调用、推送过滤）
+MQTTPublisher.h/.m 最小 MQTT 3.1.1 发布端（CONNECT / PUBLISH retain / PINGREQ）
+PowerReporter.h/.m 电源状态采集与上报（睡眠/唤醒/关机通知 + 发现配置）
+web/app.js        全部界面逻辑（设备卡片、控件、管理页）
+web/styles.css    样式（浅色/深色自动跟随系统）
+web/index.html    SVG symbol 图标集
+icon.svg          App 图标
+build.sh          编译 + 渲染图标 + 打包 + ad-hoc 签名
 ```
 
 ### 调试参数

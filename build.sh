@@ -13,8 +13,8 @@ mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 echo "==> 编译"
 clang -fobjc-arc -O2 -mmacosx-version-min=14.0 \
-  -framework Cocoa -framework WebKit \
-  main.m HAClient.m -o "$APP/Contents/MacOS/$EXE"
+  -framework Cocoa -framework WebKit -framework SystemConfiguration \
+  main.m HAClient.m MQTTPublisher.m PowerReporter.m -o "$APP/Contents/MacOS/$EXE"
 
 echo "==> 拷贝前端资源"
 cp web/index.html web/styles.css web/app.js "$APP/Contents/Resources/"
